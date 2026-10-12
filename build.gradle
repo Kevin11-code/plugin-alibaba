@@ -21,7 +21,7 @@ repositories {
     }
 }
 
-final targetJavaVersion = JavaVersion.toVersion(providers.gradleProperty('javaVersion').getOrElse('21'))
+final targetJavaVersion = JavaVersion.VERSION_21
 
 java {
     sourceCompatibility = targetJavaVersion

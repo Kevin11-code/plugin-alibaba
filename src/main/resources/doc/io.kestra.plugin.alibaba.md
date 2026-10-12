@@ -134,6 +134,8 @@ Consumes log groups by shard ingestion position, persisting a map of shard IDs t
 
 `query` is an SLS SPL consumption filter, such as `* | where level == 'ERROR'`, rather than index search or SQL analysis. `topic` optionally filters groups. `FETCH` and `STORE` return `count` and `logs` or `uri`; STORE writes incrementally. Clients shut down after every poll. A failed shard page, output upload, execution construction, or KV operation fails the poll. Cursors commit together only after all pages succeed.
 
+Use `fetchType: STORE` for high-volume logstores, long lookback windows, or catch-up after downtime. The default `FETCH` mode accumulates the complete matching backlog across all shard pages in worker memory and execution variables. It is suitable for small log batches. `STORE` writes results incrementally to internal storage and returns their URI.
+
 ```yaml
 id: sls_on_errors
 namespace: company.team

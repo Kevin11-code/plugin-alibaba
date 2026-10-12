@@ -3,6 +3,7 @@ package io.kestra.plugin.alibaba.sls;
 import com.aliyun.openservices.log.common.Consts;
 import com.aliyun.openservices.log.request.GetCursorRequest;
 import com.aliyun.openservices.log.request.PullLogsRequest;
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.annotations.PluginProperty;
@@ -66,6 +67,7 @@ import java.util.Optional;
                     project: ops-logs
                     logstore: app-events
                     query: "* | where level == 'ERROR'"
+                    fetchType: STORE
                     interval: PT1M
 
                 tasks:
@@ -132,7 +134,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     private Property<Duration> lookback = Property.ofValue(Duration.ofMinutes(5));
 
     @Builder.Default
-    @Schema(title = "Result handling mode", description = "FETCH or STORE; defaults to FETCH.")
+    @Schema(title = "Result handling mode", description = "FETCH or STORE; defaults to FETCH. FETCH accumulates the complete matching backlog in memory and execution variables. Use STORE for high-volume logstores, long lookback windows, or catch-up after downtime; STORE writes results incrementally to internal storage.")
     @PluginProperty(group = "processing")
     private Property<FetchType> fetchType = Property.ofValue(FetchType.FETCH);
 
@@ -156,7 +158,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var cursors = new LinkedHashMap<String, String>();
         if (persisted.isPresent()) {
             cursors.putAll(JacksonMapper.ofJson().readValue((byte[]) persisted.get().value(),
-                new com.fasterxml.jackson.core.type.TypeReference<Map<String, String>>() {}));
+                new TypeReference<Map<String, String>>() {}));
         }
         var rows = mode == FetchType.FETCH ? new ArrayList<Map<String, Object>>() : null;
         var file = mode == FetchType.STORE ? runContext.workingDir().createTempFile(".ion").toFile() : null;

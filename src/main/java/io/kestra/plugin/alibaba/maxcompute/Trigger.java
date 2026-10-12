@@ -30,9 +30,11 @@ import lombok.experimental.SuperBuilder;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 @SuperBuilder
 @ToString
@@ -162,7 +164,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
             return Optional.empty();
         }
         var max = new AtomicReference<>(previous);
-        java.util.function.Consumer<Map<String, Object>> track = row -> {
+        Consumer<Map<?, ?>> track = row -> {
             var next = Watermark.of(row.get(field));
             if (max.get() == null || next.compareTo(max.get()) > 0) {
                 max.set(next);
@@ -174,10 +176,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
                     if (!(row instanceof Map<?, ?> map)) {
                         throw new IllegalArgumentException("Stored MaxCompute result must contain rows");
                     }
-                    var next = Watermark.of(map.get(field));
-                    if (max.get() == null || next.compareTo(max.get()) > 0) {
-                        max.set(next);
-                    }
+                    track.accept(map);
                 });
             }
         } else {
@@ -212,7 +211,7 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
             if (value instanceof String string) {
                 try {
                     return new Watermark("instant", Instant.parse(string).toString());
-                } catch (java.time.format.DateTimeParseException e) {
+                } catch (DateTimeParseException e) {
                     return new Watermark("string", string);
                 }
             }
