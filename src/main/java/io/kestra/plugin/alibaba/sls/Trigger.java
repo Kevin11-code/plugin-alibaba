@@ -157,8 +157,13 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var persisted = runContext.namespaceKv(context.getNamespace()).getValue(key);
         var cursors = new LinkedHashMap<String, String>();
         if (persisted.isPresent()) {
-            cursors.putAll(JacksonMapper.ofJson().readValue((byte[]) persisted.get().value(),
-                new TypeReference<Map<String, String>>() {}));
+            var state = JacksonMapper.ofJson().readValue((byte[]) persisted.get().value(),
+                new TypeReference<Map<String, String>>() {});
+            if (state == null || state.entrySet().stream().anyMatch(entry -> entry.getKey() == null
+                || entry.getKey().isBlank() || entry.getValue() == null || entry.getValue().isBlank())) {
+                throw new IllegalArgumentException("Persisted SLS shard cursors must contain non-blank shard IDs and cursors");
+            }
+            cursors.putAll(state);
         }
         var rows = mode == FetchType.FETCH ? new ArrayList<Map<String, Object>>() : null;
         var file = mode == FetchType.STORE ? runContext.workingDir().createTempFile(".ion").toFile() : null;

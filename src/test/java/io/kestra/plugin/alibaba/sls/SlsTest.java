@@ -230,9 +230,11 @@ class SlsTest {
         runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
         var cond = ConditionContext.builder().runContext(rc)
             .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
-        rc.namespaceKv(ctx.getNamespace()).put(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore"),
-            new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), "invalid JSON".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        assertThrows(Exception.class, () -> task.evaluate(cond, ctx));
+        for (var state : List.of("invalid JSON", "null", "{\"0\":null}", "{\"0\":\" \"}", "{\"\":\"end\"}")) {
+            rc.namespaceKv(ctx.getNamespace()).put(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore"),
+                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            assertThrows(Exception.class, () -> task.evaluate(cond, ctx), state);
+        }
         assertEquals(0, server.getAllServeEvents().size());
     }
 

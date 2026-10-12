@@ -171,10 +171,12 @@ class MaxComputeTest {
             var state = rc.namespaceKv(ctx.getNamespace()).getValue(Trigger.watermarkKey(ctx.getFlowId(), id)).orElseThrow();
             var watermark = JacksonMapper.ofJson().readValue((byte[]) state.value(), Trigger.Watermark.class);
             assertEquals(new Trigger.Watermark("number", "10"), watermark);
+            // A repeated non-empty response must not re-fire even if the service returns stale rows.
+            assertFalse(task.evaluate(cond, ctx).isPresent());
             stubResult();
             assertFalse(task.evaluate(cond, ctx).isPresent());
         }
-        server.verify(2, postRequestedFor(urlPathEqualTo("/projects/analytics/instances"))
+        server.verify(4, postRequestedFor(urlPathEqualTo("/projects/analytics/instances"))
             .withRequestBody(containing("id &gt; &apos;10&apos;")));
     }
 
@@ -204,9 +206,12 @@ class MaxComputeTest {
         runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
         var cond = ConditionContext.builder().runContext(rc)
             .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
-        rc.namespaceKv(ctx.getNamespace()).put(Trigger.watermarkKey(ctx.getFlowId(), id),
-            new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), "invalid JSON".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        assertThrows(Exception.class, () -> task.evaluate(cond, ctx));
+        for (var state : List.of("invalid JSON", "null", "{}", "{\"type\":\"number\",\"value\":\"bad\"}",
+            "{\"type\":\"instant\",\"value\":\"bad\"}", "{\"type\":\"unknown\",\"value\":\"10\"}")) {
+            rc.namespaceKv(ctx.getNamespace()).put(Trigger.watermarkKey(ctx.getFlowId(), id),
+                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            assertThrows(Exception.class, () -> task.evaluate(cond, ctx), state);
+        }
         assertEquals(0, server.getAllServeEvents().size());
     }
 

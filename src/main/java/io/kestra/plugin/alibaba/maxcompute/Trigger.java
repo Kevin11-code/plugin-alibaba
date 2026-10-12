@@ -150,6 +150,9 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
         var persisted = runContext.namespaceKv(namespace).getValue(key);
         Watermark previous = persisted.isPresent()
             ? JacksonMapper.ofJson().readValue((byte[]) persisted.get().value(), Watermark.class) : null;
+        if (persisted.isPresent() && previous == null) {
+            throw new IllegalArgumentException("Persisted MaxCompute watermark must not be null");
+        }
         var value = previous == null ? runContext.render(initialWatermark).as(String.class).orElse("") : previous.value();
         var escaped = escapeWatermark(value);
         var variables = Map.<String, Object>of("watermark", escaped, "trigger", Map.of("watermark", escaped));
@@ -201,6 +204,18 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     }
 
     public record Watermark(String type, String value) implements Comparable<Watermark> {
+        public Watermark {
+            if (type == null || value == null) {
+                throw new IllegalArgumentException("Watermark type and value must not be null");
+            }
+            switch (type) {
+                case "number" -> new BigDecimal(value);
+                case "instant" -> Instant.parse(value);
+                case "string" -> { }
+                default -> throw new IllegalArgumentException("Unsupported persisted watermark type: " + type);
+            }
+        }
+
         static Watermark of(Object value) {
             if (value == null) {
                 throw new IllegalArgumentException("Every row must have a non-null `watermarkField`");
