@@ -13,7 +13,9 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.*;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 
 @KestraTest
 class AbstractConnectionTest {
@@ -40,7 +42,7 @@ class AbstractConnectionTest {
             .accessKeySecret(Property.ofExpression("{{ sk }}"))
             .securityToken(Property.ofExpression("{{ token }}"))
             .region(Property.ofExpression("{{ region }}"))
-            .endpoint(Property.ofValue("https://custom.endpoint.com"))
+            .endpointOverride(Property.ofValue("https://custom.endpoint.com"))
             .build();
 
         assertThat(task.renderedAccessKeyId(runContext), is("my-access-key"));

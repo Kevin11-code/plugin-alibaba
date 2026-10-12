@@ -35,20 +35,37 @@
 </p>
 <p align="center" style="color:grey;"><i>Get started with Kestra in 3 minutes.</i></p>
 
-# Alibaba Cloud Plugin for Kestra
-
-## Why
-
-- What user problem does this solve? Enables running SQL on Alibaba Cloud MaxCompute data warehouse, ingesting and querying logs in Simple Log Service (SLS), and triggering reactive flows on new data or logs natively within Kestra without custom scripts or external CLI dependencies.
-- Why would a team adopt this plugin in a workflow? Native tasks give typed properties, secret masking, stored result sets, remote cancellation support, and exactly-once event triggers.
-- What operational/business outcome does it enable? It simplifies cloud data warehouse orchestration and log monitoring on Alibaba Cloud.
+# Kestra Alibaba Cloud Plugin
 
 ## What
 
-- Provides plugin components under `io.kestra.plugin.alibaba.maxcompute` and `io.kestra.plugin.alibaba.sls`.
-- Includes classes:
-  - MaxCompute: `Query`, `Trigger`
-  - Simple Log Service (SLS): `Query`, `Push`, `Trigger`
+- Provides plugin components under `io.kestra.plugin.alibaba`.
+- OSS: `Upload` and `Download` move files between Kestra internal storage and buckets.
+- MaxCompute: `Query` runs SQL with fetch/store modes and remote cancellation; `Trigger` tracks new rows using typed watermarks.
+- SLS: `Query` searches logs, `Push` ingests structured data, and `Trigger` consumes new logs with persisted shard cursors.
+
+See [plugin documentation](src/main/resources/doc/io.kestra.plugin.alibaba.md) for connection options and examples.
+
+## Usage
+
+```yaml
+id: oss_upload
+namespace: company.team
+
+inputs:
+  - id: file
+    type: FILE
+
+tasks:
+  - id: upload
+    type: io.kestra.plugin.alibaba.oss.Upload
+    accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
+    accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
+    region: cn-hangzhou
+    bucket: my-bucket
+    key: "landing/{{ inputs.file | fileName }}"
+    from: "{{ inputs.file }}"
+```
 
 ## Running Kestra locally with this plugin
 

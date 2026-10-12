@@ -1,97 +1,159 @@
 # How to use the Alibaba Cloud plugin
 
-Integrate your Kestra workflows with Alibaba Cloud services, including MaxCompute for data warehousing and Simple Log Service (SLS) for log querying, ingestion, and event triggering.
+This plugin integrates Kestra flows with Alibaba Cloud. It covers OSS file transfers, MaxCompute SQL, and Simple Log Service (SLS) log ingestion, queries, and polling triggers. See the [OSS Java SDK reference](https://www.alibabacloud.com/help/en/oss/developer-reference/oss-java-sdk/) for the underlying API.
 
 ## Authentication
 
-All tasks authenticate with Alibaba Cloud using standard credentials:
+Every task needs an AccessKey pair, and a Security Token Service (STS) token when you use temporary credentials.
 
-- `accessKeyId`: Alibaba Cloud AccessKey ID.
-- `accessKeySecret`: Alibaba Cloud AccessKey Secret (stored securely and masked in outputs).
-- `securityToken`: Optional Security Token Service (STS) temporary token.
+- `accessKeyId`: the AccessKey ID.
+- `accessKeySecret`: the AccessKey secret.
+- `securityToken`: optional STS token.
+- `region`: the region ID, for example `cn-hangzhou`. Default endpoints are `https://oss-<region>.aliyuncs.com`, `https://service.<region>.maxcompute.aliyun.com/api`, and `https://<region>.log.aliyuncs.com`.
+- `endpointOverride`: optional URL that replaces the region-derived endpoint. OSS requires https unless `pathStyleAccess` is true. MaxCompute and SLS also accept explicit http URLs for local endpoints. For SLS, specify the full service endpoint, including the project hostname for private endpoints; an explicit port is preserved. Treat it as trusted input, because signed requests and the STS token are sent to it.
 
-When defining credentials in tasks, always store sensitive keys using Kestra [secrets](https://kestra.io/docs/concepts/secret):
+Role-based credentials (ECS instance roles and RAM roles) are not supported.
+
+Store the credentials as [secrets](https://kestra.io/docs/concepts/secret) and set them once for all tasks with [plugin defaults](https://kestra.io/docs/workflow-components/plugin-defaults):
 
 ```yaml
-accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
-accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
+pluginDefaults:
+  - type: io.kestra.plugin.alibaba.oss
+    values:
+      accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
+      accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
+      region: cn-hangzhou
 ```
 
-## Common Properties
+## Tasks
 
-Set `region` on each task (for example, `cn-hangzhou`, `cn-shanghai`, `ap-southeast-1`). Tasks also support `endpoint` for connecting to custom or private VPC endpoints.
+### `io.kestra.plugin.alibaba.oss.Upload`
 
-## Tasks and Triggers
+Uploads a file from Kestra internal storage to a bucket. The file is sent in a single request, so it is limited to 5 GB.
 
-### MaxCompute (ODPS)
+- Required: `bucket`, `key`, `from`.
+- Optional: `pathStyleAccess` (address buckets as `<endpoint>/<bucket>`, useful with emulators).
+- Outputs: `etag`, `key`.
 
-MaxCompute provides petabyte-scale cloud data warehousing and big data processing.
+### `io.kestra.plugin.alibaba.oss.Download`
 
-- `io.kestra.plugin.alibaba.maxcompute.Query`: Executes SQL statements against MaxCompute tables. Supports `FETCH_ONE`, `FETCH`, `STORE` (streaming to Kestra internal storage), and `NONE` fetch types. Supports task cancellation (`kill()`).
-- `io.kestra.plugin.alibaba.maxcompute.Trigger`: Polling trigger that detects new rows in a MaxCompute table using a watermark column stored in Kestra namespace KV store.
+Downloads an object into Kestra internal storage.
 
-#### Example: Run SQL on MaxCompute
+- Required: `bucket`, `key`.
+- Optional: `pathStyleAccess`.
+- Outputs: `uri`, `size`.
+
+### `io.kestra.plugin.alibaba.maxcompute.Query`
+
+Runs SQL and waits for success. Cancellation stops the remote instance, including cancellation during submission.
+
+- Required: `project`, `sql`, credentials, and either `region` or `endpointOverride`.
+- `fetchType`: `NONE` (default), `FETCH`, `FETCH_ONE`, or `STORE`.
+- `tunnelEndpoint`: optional instance result tunnel URL; applies to result downloads.
+- Outputs: `instanceId`, `size`, and `rows`, `row`, or `uri`. `FETCH_ONE` reads at most one row, so its size is 0 or 1.
+- `STORE` writes incrementally to Ion using the SDK's bounded result iterator. The RAM principal needs result tunnel download permissions.
 
 ```yaml
 id: maxcompute_query
 namespace: company.team
 
 tasks:
-  - id: run_analytics
+  - id: query
     type: io.kestra.plugin.alibaba.maxcompute.Query
     accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
     accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
-    region: cn-hangzhou
-    project: analytics_project
-    sql: "SELECT user_id, count(*) AS total FROM user_events GROUP BY user_id;"
-    fetchType: FETCH
+    region: cn-shanghai
+    project: analytics
+    sql: SELECT id, amount FROM orders
+    fetchType: STORE
 ```
 
-### Simple Log Service (SLS)
+### `io.kestra.plugin.alibaba.maxcompute.Trigger`
 
-Simple Log Service is Alibaba Cloud's all-in-one logging service for log collection, querying, consumption, and real-time processing.
+Polls SQL and produces one execution per non-empty batch. Required `watermarkField` must be a monotonically increasing, non-null column included in every row. `initialWatermark` defaults to empty; use a lower bound such as `0` for numeric IDs. Numeric values compare numerically, ISO instants chronologically, and other strings lexicographically. Type and value are persisted together in namespace KV.
 
-- `io.kestra.plugin.alibaba.sls.Query`: Queries logs from a logstore using SQL/Search queries, with time ranges and `FETCH_ONE`, `FETCH`, or `STORE` fetch modes.
-- `io.kestra.plugin.alibaba.sls.Push`: Ingests log records into a logstore from inline maps or from files in Kestra internal storage.
-- `io.kestra.plugin.alibaba.sls.Trigger`: Polling trigger that queries for new log records matching a query filter and maintains an epoch cursor in Kestra namespace KV store.
+Use a strict greater-than filter and ascending order. Do not split rows sharing a watermark across batches: a subsequent strict filter skips the remaining ties. Prefer a unique increasing column when timestamps are not unique. Late inserts below the committed watermark are outside this trigger's contract.
 
-#### Example: Query Logs from SLS
+`trigger.watermark` is text interpolated into SQL, escaped for a single-quoted literal. Surround it with quotes in SQL. `FETCH` and `STORE` both advance from delivered rows. KV read and write failures fail the poll.
 
 ```yaml
-id: sls_query_flow
+id: maxcompute_new_orders
 namespace: company.team
 
 tasks:
-  - id: query_errors
-    type: io.kestra.plugin.alibaba.sls.Query
+  - id: report
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ trigger.size }} new orders"
+
+triggers:
+  - id: orders
+    type: io.kestra.plugin.alibaba.maxcompute.Trigger
     accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
     accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
-    region: cn-hangzhou
-    project: production_logs
-    logstore: app_stdout
-    from: "-15m"
-    to: "now"
-    query: "level: ERROR"
-    fetchType: FETCH
+    region: cn-shanghai
+    project: analytics
+    sql: SELECT id, amount FROM orders WHERE id > '{{ trigger.watermark }}' ORDER BY id ASC LIMIT 50
+    watermarkField: id
+    initialWatermark: "0"
+    fetchType: STORE
+    interval: PT1M
 ```
 
-#### Example: Push Logs to SLS
+### `io.kestra.plugin.alibaba.sls.Query`
+
+Queries one page of logs by search filter or SQL analysis. Set `project` and `logstore`; `query` and `topic` default to empty. `from` and `to` accept ISO instants or epoch seconds, defaulting to the past 15 minutes through now. Invalid times fail instead of silently changing the window.
+
+`lines` is 1–100 (default 100); `offset` is non-negative (default 0). Use offsets for additional search pages. Incomplete responses fail. `FETCH` (default), `FETCH_ONE`, `STORE`, and `NONE` return `count` and applicable `logs`, `log`, or `uri`.
+
+### `io.kestra.plugin.alibaba.sls.Push`
+
+Ingests logs into `project` / `logstore`. `from` uses Kestra's `Data.From` contract: inline maps, lists, JSON strings, or supported data URIs. Records are consumed with `Data.from(from).read(runContext)` and sent in batches of at most 4,096. Internal storage reads follow the runtime's Ion format, including binary Ion on Kestra 2.0.
+
+`__time__` accepts epoch seconds; `timestamp` accepts an ISO instant. Absent timestamps use current time. Invalid values fail with the record index and field name. SLS's unsigned 32-bit epoch range is enforced, including dates after 2038.
 
 ```yaml
-id: sls_push_flow
+id: sls_push
 namespace: company.team
 
 tasks:
-  - id: ingest_logs
+  - id: push
     type: io.kestra.plugin.alibaba.sls.Push
     accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
     accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
     region: cn-hangzhou
-    project: production_logs
-    logstore: audit_trail
+    project: ops-logs
+    logstore: app-events
     from:
-      - message: "Deployment completed"
-        environment: "production"
-      - message: "Cache invalidated"
-        environment: "production"
+      - level: INFO
+        message: Flow finished
 ```
+
+### `io.kestra.plugin.alibaba.sls.Trigger`
+
+Consumes log groups by shard ingestion position, persisting a map of shard IDs to opaque cursors in namespace KV. Each poll snapshots shard end cursors and consumes all pages up to them. Newly ingested logs with older event timestamps are included. New shards start at `lookback` (default `PT5M`); readonly shards returned by SLS after splits are also consumed.
+
+`query` is an SLS SPL consumption filter, such as `* | where level == 'ERROR'`, rather than index search or SQL analysis. `topic` optionally filters groups. `FETCH` and `STORE` return `count` and `logs` or `uri`; STORE writes incrementally. Clients shut down after every poll. A failed shard page, output upload, execution construction, or KV operation fails the poll. Cursors commit together only after all pages succeed.
+
+```yaml
+id: sls_on_errors
+namespace: company.team
+
+tasks:
+  - id: alert
+    type: io.kestra.plugin.core.log.Log
+    message: "{{ trigger.count }} error logs received"
+
+triggers:
+  - id: errors
+    type: io.kestra.plugin.alibaba.sls.Trigger
+    accessKeyId: "{{ secret('ALIBABA_ACCESS_KEY_ID') }}"
+    accessKeySecret: "{{ secret('ALIBABA_ACCESS_KEY_SECRET') }}"
+    region: cn-hangzhou
+    project: ops-logs
+    logstore: app-events
+    query: "* | where level == 'ERROR'"
+    fetchType: STORE
+    interval: PT1M
+```
+
+Both triggers use length-prefixed state keys. State commits and scheduler execution persistence are separate operations, so downstream processing should be idempotent across scheduler crashes; these triggers do not claim transactional exactly-once delivery. Cursor expiry surfaces as an error rather than resetting state and replaying logs.

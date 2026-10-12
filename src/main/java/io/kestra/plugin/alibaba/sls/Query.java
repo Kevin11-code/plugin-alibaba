@@ -1,9 +1,5 @@
 package io.kestra.plugin.alibaba.sls;
 
-import com.aliyun.openservices.log.Client;
-import com.aliyun.openservices.log.common.LogContent;
-import com.aliyun.openservices.log.common.LogItem;
-import com.aliyun.openservices.log.common.QueriedLog;
 import com.aliyun.openservices.log.request.GetLogsRequest;
 import com.aliyun.openservices.log.response.GetLogsResponse;
 import io.kestra.core.models.annotations.Example;
@@ -18,18 +14,27 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.alibaba.AbstractConnection;
 import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
-import lombok.*;
+import lombok.Builder;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 import reactor.core.publisher.Flux;
 
 import java.io.BufferedOutputStream;
-import java.io.File;
 import java.io.FileOutputStream;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 @SuperBuilder
 @ToString
@@ -93,13 +98,16 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
     private Property<String> to;
 
     @Builder.Default
-    @Schema(title = "Offset", description = "Line offset for pagination; defaults to 0.")
+    @Schema(title = "Offset", description = "Non-negative line offset for pagination; defaults to 0.")
     @PluginProperty(group = "processing")
+    @Min(0)
     private Property<Integer> offset = Property.ofValue(0);
 
     @Builder.Default
     @Schema(title = "Lines", description = "Maximum number of log lines to return; defaults to 100, max 100.")
     @PluginProperty(group = "processing")
+    @Min(1)
+    @Max(100)
     private Property<Integer> lines = Property.ofValue(100);
 
     @Builder.Default
@@ -114,71 +122,57 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        String rAccessKeyId = renderedAccessKeyId(runContext);
-        String rAccessKeySecret = renderedAccessKeySecret(runContext);
-        String rSecurityToken = renderedSecurityToken(runContext);
-        String rRegion = renderedRegion(runContext);
-        String rEndpoint = renderedEndpoint(runContext);
-        String rProject = runContext.render(this.project).as(String.class).orElseThrow();
-        String rLogstore = runContext.render(this.logstore).as(String.class).orElseThrow();
-        String rQuery = runContext.render(this.query).as(String.class).orElse("");
-        String rTopic = runContext.render(this.topic).as(String.class).orElse("");
-        int rOffset = runContext.render(this.offset).as(Integer.class).orElse(0);
-        int rLines = runContext.render(this.lines).as(Integer.class).orElse(100);
-        boolean rReverse = runContext.render(this.reverse).as(Boolean.class).orElse(false);
-        FetchType rFetchType = runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.FETCH);
-
-        com.aliyun.openservices.log.http.client.ClientConfiguration clientConfig = new com.aliyun.openservices.log.http.client.ClientConfiguration();
-        String endpoint = rEndpoint;
-        if (endpoint != null && !endpoint.isBlank()) {
-            try {
-                URI uri = URI.create(endpoint.startsWith("http://") || endpoint.startsWith("https://") ? endpoint : "http://" + endpoint);
-                if (uri.getPort() != -1) {
-                    clientConfig.setProxyHost(uri.getHost());
-                    clientConfig.setProxyPort(uri.getPort());
-                    endpoint = (uri.getScheme() != null ? uri.getScheme() : "http") + "://log.aliyuncs.com";
-                }
-            } catch (Exception ignored) {
-            }
-        } else {
-            endpoint = (rRegion != null ? rRegion : "cn-hangzhou") + ".log.aliyuncs.com";
+        var rProject = required(runContext, project, "project");
+        var rLogstore = required(runContext, logstore, "logstore");
+        var rQuery = runContext.render(query).as(String.class).orElse("");
+        var rTopic = runContext.render(topic).as(String.class).orElse("");
+        var rOffset = runContext.render(offset).as(Integer.class).orElse(0);
+        var rLines = runContext.render(lines).as(Integer.class).orElse(100);
+        if (rOffset < 0 || rLines < 1 || rLines > 100) {
+            throw new IllegalArgumentException("`offset` must be non-negative and `lines` must be between 1 and 100");
         }
+        var rReverse = runContext.render(reverse).as(Boolean.class).orElse(false);
+        var rFetchType = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
+        var toEpoch = parseEpochSecond(runContext.render(this.to).as(String.class).orElse(null), Math.toIntExact(Instant.now().getEpochSecond()));
+        var fromEpoch = parseEpochSecond(runContext.render(this.from).as(String.class).orElse(null), toEpoch - 900);
 
-        Client client;
-        if (rSecurityToken != null && !rSecurityToken.isBlank()) {
-            client = new Client(endpoint, rAccessKeyId, rAccessKeySecret, rSecurityToken, clientConfig);
-        } else {
-            client = new Client(endpoint, rAccessKeyId, rAccessKeySecret, clientConfig);
+        if (fromEpoch >= toEpoch) {
+            throw new IllegalArgumentException("`from` must be earlier than `to`");
         }
+        var request = new GetLogsRequest(rProject, rLogstore, fromEpoch, toEpoch, rTopic, rQuery, rOffset, rLines, rReverse);
 
-        int toEpoch = parseEpochSecond(runContext.render(this.to).as(String.class).orElse(null), (int) Instant.now().getEpochSecond());
-        int fromEpoch = parseEpochSecond(runContext.render(this.from).as(String.class).orElse(null), toEpoch - 900);
-
-        GetLogsRequest request = new GetLogsRequest(rProject, rLogstore, fromEpoch, toEpoch, rTopic, rQuery, rOffset, rLines, rReverse);
-
-        Instant start = Instant.now();
-        GetLogsResponse response = client.GetLogs(request);
-        Instant end = Instant.now();
+        var start = Instant.now();
+        GetLogsResponse response;
+        var client = slsClient(runContext);
+        try {
+            response = client.GetLogs(request);
+        } finally {
+            client.shutdown();
+        }
+        if (!response.IsCompleted()) {
+            throw new IllegalStateException("SLS query is incomplete; retry the query before using its results");
+        }
+        var end = Instant.now();
         runContext.metric(Timer.of("duration", Duration.between(start, end)));
 
-        List<QueriedLog> queriedLogs = response.GetLogs();
-        List<Map<String, Object>> rows = new ArrayList<>(queriedLogs.size());
+        var queriedLogs = response.GetLogs();
+        var rows = new ArrayList<Map<String, Object>>(queriedLogs.size());
 
-        for (QueriedLog qLog : queriedLogs) {
-            LogItem item = qLog.GetLogItem();
-            Map<String, Object> map = new LinkedHashMap<>();
-            map.put("__time__", item.GetTime());
+        for (var qLog : queriedLogs) {
+            var item = qLog.GetLogItem();
+            var map = new LinkedHashMap<String, Object>();
+            map.put("__time__", Integer.toUnsignedLong(item.GetTime()));
             map.put("__source__", qLog.GetSource());
-            for (LogContent content : item.GetLogContents()) {
+            for (var content : item.GetLogContents()) {
                 map.put(content.GetKey(), content.GetValue());
             }
             rows.add(map);
         }
 
-        long count = rows.size();
+        var count = (long) rows.size();
         runContext.metric(Counter.of("total.rows", count));
 
-        Output.OutputBuilder builder = Output.builder()
+        var builder = Output.builder()
             .count(count);
 
         if (FetchType.NONE.equals(rFetchType)) {
@@ -188,13 +182,13 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
         if (FetchType.FETCH.equals(rFetchType)) {
             builder.logs(rows);
         } else if (FetchType.FETCH_ONE.equals(rFetchType)) {
-            builder.log(rows.isEmpty() ? Collections.emptyMap() : rows.get(0));
+            builder.log(rows.isEmpty() ? Collections.emptyMap() : rows.getFirst());
         } else if (FetchType.STORE.equals(rFetchType)) {
-            File tempFile = runContext.workingDir().createTempFile(".ion").toFile();
+            var tempFile = runContext.workingDir().createTempFile(".ion").toFile();
             try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
                 Long lineCount = FileSerde.writeAll(output, Flux.fromIterable(rows)).block();
                 output.flush();
-                URI uri = runContext.storage().putFile(tempFile);
+                var uri = runContext.storage().putFile(tempFile);
                 builder.uri(uri).count(lineCount);
             }
         }
@@ -207,12 +201,12 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
             return defaultValue;
         }
         try {
-            return Integer.parseInt(value);
+            return Math.toIntExact(Long.parseLong(value));
         } catch (NumberFormatException e) {
             try {
-                return (int) Instant.parse(value).getEpochSecond();
-            } catch (Exception ex) {
-                return defaultValue;
+                return Math.toIntExact(Instant.parse(value).getEpochSecond());
+            } catch (RuntimeException ex) {
+                throw new IllegalArgumentException("Invalid SLS time: '" + value + "'; expected ISO instant or epoch seconds", ex);
             }
         }
     }

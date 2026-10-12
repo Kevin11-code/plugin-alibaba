@@ -1,11 +1,9 @@
 package io.kestra.plugin.alibaba.maxcompute;
 
-import com.aliyun.odps.Instance;
 import com.aliyun.odps.Odps;
 import com.aliyun.odps.account.Account;
 import com.aliyun.odps.account.AliyunAccount;
 import com.aliyun.odps.account.StsAccount;
-import com.aliyun.odps.data.Record;
 import com.aliyun.odps.task.SQLTask;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
@@ -20,17 +18,28 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.alibaba.AbstractConnection;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import lombok.*;
+import lombok.AccessLevel;
+import lombok.Builder;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.ToString;
 import lombok.experimental.SuperBuilder;
-import reactor.core.publisher.Flux;
 
 import java.io.BufferedOutputStream;
-import java.io.File;
 import java.io.FileOutputStream;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @SuperBuilder
@@ -119,103 +128,116 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
     private Property<String> tunnelEndpoint;
 
     @Getter(AccessLevel.NONE)
-    private final transient AtomicReference<Instance> instanceRef = new AtomicReference<>();
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final transient AtomicBoolean isKilled = new AtomicBoolean();
+
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final transient AtomicReference<Runnable> killable = new AtomicReference<>();
 
     @Override
     public Output run(RunContext runContext) throws Exception {
-        String rAccessKeyId = renderedAccessKeyId(runContext);
-        String rAccessKeySecret = renderedAccessKeySecret(runContext);
-        String rSecurityToken = renderedSecurityToken(runContext);
-        String rRegion = renderedRegion(runContext);
-        String rEndpoint = renderedEndpoint(runContext);
-        String rProject = runContext.render(this.project).as(String.class).orElseThrow();
-        String rSql = runContext.render(this.sql).as(String.class).orElseThrow();
-        FetchType rFetchType = runContext.render(this.fetchType).as(FetchType.class).orElse(FetchType.NONE);
-
+        checkKilled();
+        var rProject = required(runContext, project, "project");
+        var rSql = required(runContext, sql, "sql");
+        var rFetchType = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.NONE);
+        var rEndpoint = renderedEndpoint(runContext);
         if (rEndpoint == null || rEndpoint.isBlank()) {
-            rEndpoint = "https://service." + rRegion + ".maxcompute.aliyun.com/api";
+            rEndpoint = "https://service." + renderedRegion(runContext) + ".maxcompute.aliyun.com/api";
         }
-
-        Account account;
-        if (rSecurityToken != null && !rSecurityToken.isBlank()) {
-            account = new StsAccount(rAccessKeyId, rAccessKeySecret, rSecurityToken);
-        } else {
-            account = new AliyunAccount(rAccessKeyId, rAccessKeySecret);
-        }
-
-        Odps odps = new Odps(account);
+        var token = renderedSecurityToken(runContext);
+        Account account = token == null || token.isBlank()
+            ? new AliyunAccount(renderedAccessKeyId(runContext), renderedAccessKeySecret(runContext))
+            : new StsAccount(renderedAccessKeyId(runContext), renderedAccessKeySecret(runContext), token);
+        var odps = new Odps(account);
         odps.setEndpoint(rEndpoint);
         odps.setDefaultProject(rProject);
-
-        String rTunnelEndpoint = runContext.render(this.tunnelEndpoint).as(String.class).orElse(null);
-        if (rTunnelEndpoint != null && !rTunnelEndpoint.isBlank()) {
-            odps.getTunnelEndpoint(); // warm-up
-        }
-
-        String taskName = "kestra_" + (runContext.flowInfo() != null ? runContext.flowInfo().id() : "flow") + "_" + UUID.randomUUID().toString().replace("-", "");
-
-        runContext.logger().info("Executing MaxCompute SQL query on project '{}': {}", rProject, rSql);
-
-        Instant start = Instant.now();
-        Instance instance = SQLTask.run(odps, rProject, rSql, taskName, null, null);
-        instanceRef.set(instance);
-
-        instance.waitForSuccess();
-        Instant end = Instant.now();
-        runContext.metric(Timer.of("duration", Duration.between(start, end)));
-
-        Output.OutputBuilder builder = Output.builder()
-            .instanceId(instance.getId());
-
-        if (FetchType.NONE.equals(rFetchType)) {
-            builder.size(0L);
-            return builder.build();
-        }
-
-        List<Record> records = SQLTask.getResult(instance);
-        List<Map<String, Object>> rows = new ArrayList<>(records.size());
-        for (Record record : records) {
-            Map<String, Object> row = new LinkedHashMap<>();
-            for (int i = 0; i < record.getColumnCount(); i++) {
-                String colName = record.getColumns()[i].getName();
-                Object val = record.get(i);
-                if (val instanceof Date date) {
-                    val = date.toInstant().toString();
+        var tunnel = runContext.render(tunnelEndpoint).as(String.class).orElse(null);
+        var taskName = "kestra_" + UUID.randomUUID().toString().replace("-", "");
+        var start = Instant.now();
+        var instance = SQLTask.run(odps, rProject, rSql, taskName, null, null);
+        Runnable stop = () -> {
+            try {
+                if (!instance.isTerminated()) {
+                    instance.stop();
                 }
-                row.put(colName, val);
+            } catch (Exception e) {
+                runContext.logger().warn("Could not stop MaxCompute instance '{}'", instance.getId(), e);
             }
-            rows.add(row);
+        };
+        killable.set(stop);
+        if (isKilled.get()) {
+            stopInstance();
         }
-
-        long count = rows.size();
-        runContext.metric(Counter.of("total.rows", count));
-        builder.size(count);
-
-        if (FetchType.FETCH.equals(rFetchType)) {
-            builder.rows(rows);
-        } else if (FetchType.FETCH_ONE.equals(rFetchType)) {
-            builder.row(rows.isEmpty() ? Collections.emptyMap() : rows.get(0));
-        } else if (FetchType.STORE.equals(rFetchType)) {
-            File tempFile = runContext.workingDir().createTempFile(".ion").toFile();
-            try (var output = new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
-                Long lineCount = FileSerde.writeAll(output, Flux.fromIterable(rows)).block();
-                output.flush();
-                URI uri = runContext.storage().putFile(tempFile);
-                builder.uri(uri).size(lineCount);
+        try {
+            checkKilled();
+            instance.waitForSuccess();
+            checkKilled();
+            runContext.metric(Timer.of("duration", Duration.between(start, Instant.now())));
+            var builder = Output.builder().instanceId(instance.getId());
+            if (rFetchType == FetchType.NONE) {
+                return builder.size(0L).build();
             }
+            var records = SQLTask.getResultSet(instance, taskName, rFetchType == FetchType.FETCH_ONE ? 1L : null,
+                false, tunnel == null || tunnel.isBlank() ? null : URI.create(tunnel));
+            var rows = rFetchType == FetchType.STORE ? null : new ArrayList<Map<String, Object>>();
+            var tempFile = rFetchType == FetchType.STORE ? runContext.workingDir().createTempFile(".ion").toFile() : null;
+            var count = 0L;
+            try (var output = tempFile == null ? null : new BufferedOutputStream(new FileOutputStream(tempFile), FileSerde.BUFFER_SIZE)) {
+                for (var record : records) {
+                    checkKilled();
+                    var row = new LinkedHashMap<String, Object>();
+                    for (var i = 0; i < record.getColumnCount(); i++) {
+                        var value = record.get(i);
+                        if (value instanceof java.sql.Date date) {
+                            value = date.toLocalDate().toString();
+                        } else if (value instanceof Date date) {
+                            value = date.toInstant().toString();
+                        }
+                        row.put(record.getColumns()[i].getName(), value);
+                    }
+                    if (output == null) {
+                        rows.add(row);
+                    } else {
+                        FileSerde.write(output, row);
+                    }
+                    count++;
+                }
+            }
+            runContext.metric(Counter.of("total.rows", count));
+            builder.size(count);
+            if (rFetchType == FetchType.STORE) {
+                builder.uri(runContext.storage().putFile(tempFile));
+            } else if (rFetchType == FetchType.FETCH) {
+                builder.rows(rows);
+            } else {
+                builder.row(rows.isEmpty() ? Collections.emptyMap() : rows.getFirst());
+            }
+            return builder.build();
+        } finally {
+            killable.compareAndSet(stop, null);
         }
+    }
 
-        return builder.build();
+    private void checkKilled() {
+        if (isKilled.get()) {
+            throw new CancellationException("MaxCompute query was cancelled");
+        }
+    }
+
+    private void stopInstance() {
+        var stop = killable.getAndSet(null);
+        if (stop != null) {
+            stop.run();
+        }
     }
 
     @Override
     public void kill() {
-        try {
-            Instance instance = instanceRef.get();
-            if (instance != null && !instance.isTerminated()) {
-                instance.stop();
-            }
-        } catch (Exception ignored) {
+        if (isKilled.compareAndSet(false, true)) {
+            stopInstance();
         }
     }
 

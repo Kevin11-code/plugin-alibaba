@@ -1,14 +1,14 @@
 plugins {
-    id 'io.kestra.gradle.repository-conventions' version '1.2.10'
+    id 'io.kestra.gradle.repository-conventions' version '1.2.11'
     id "com.vanniktech.maven.publish" version "0.37.0"
-    id "io.kestra.gradle.inject-bom-versions" version "1.2.10"
-    id "io.kestra.gradle.plugin-doc-lint" version "1.2.10"
+    id "io.kestra.gradle.inject-bom-versions" version '1.2.11'
+    id "io.kestra.gradle.plugin-doc-lint" version '1.2.11'
     id 'java-library'
     id "idea"
     id 'jacoco'
     id "com.gradleup.shadow" version "9.6.1"
     id 'signing'
-    id 'net.researchgate.release' version '3.1.0'
+    id 'net.researchgate.release' version '3.2.0'
 }
 
 def isBuildSnapshot = version.toString().endsWith("-SNAPSHOT")
@@ -21,7 +21,7 @@ repositories {
     }
 }
 
-final targetJavaVersion = JavaVersion.VERSION_21
+final targetJavaVersion = JavaVersion.toVersion(providers.gradleProperty('javaVersion').getOrElse('21'))
 
 java {
     sourceCompatibility = targetJavaVersion
@@ -29,7 +29,8 @@ java {
 }
 
 group = "io.kestra.plugin"
-description = 'Plugin for Alibaba Cloud in Kestra'
+description = 'Alibaba Cloud plugin for Kestra'
+
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
@@ -51,10 +52,27 @@ dependencies {
     compileOnly group: "io.kestra", name: "script", version: kestraVersion
 
     // MaxCompute Java SDK
-    implementation "com.aliyun.odps:odps-sdk-core:0.52.3-public"
+    implementation("com.aliyun.odps:odps-sdk-core:0.52.3-public") {
+        exclude group: "com.squareup.okhttp3"
+        exclude group: "org.codehaus.jackson"
+        exclude group: "commons-logging"
+        exclude group: "io.netty", module: "netty-all"
+        exclude group: "com.aliyun", module: "aliyun-java-auth"
+        exclude group: "com.aliyun", module: "credentials-java"
+        exclude group: "com.aliyun", module: "tea"
+        exclude group: "org.antlr", module: "antlr4"
+        exclude group: "org.apache.arrow", module: "arrow-memory-netty"
+    }
 
     // Simple Log Service Java SDK
     implementation "com.aliyun.openservices:aliyun-log:0.6.126"
+    implementation("com.aliyun.oss:aliyun-sdk-oss:3.18.2") {
+        exclude group: "com.aliyun", module: "aliyun-java-sdk-core"
+        exclude group: "com.aliyun", module: "aliyun-java-sdk-ram"
+        exclude group: "com.aliyun", module: "aliyun-java-sdk-kms"
+        exclude group: "com.aliyun", module: "aliyun-java-sdk-ecs"
+    }
+
 }
 
 
@@ -91,9 +109,12 @@ dependencies {
 
     // test
     testImplementation "org.junit.jupiter:junit-jupiter-engine"
+    testImplementation "org.mockito:mockito-core"
     testImplementation "org.hamcrest:hamcrest"
     testImplementation "org.hamcrest:hamcrest-library"
-    testImplementation "org.wiremock:wiremock-standalone:3.5.4"
+
+    testImplementation "org.wiremock:wiremock-jetty12"
+
 }
 
 /**********************************************************************************************************************\
@@ -168,7 +189,37 @@ jar {
 
 shadowJar {
     archiveClassifier.set(null)
+    filesMatching('META-INF/services/**') {
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+    dependencies {
+        exclude(dependency('com.fasterxml.jackson.core:.*'))
+        exclude(dependency('org.slf4j:.*'))
+    }
     mergeServiceFiles()
+    relocate "com.aliyun.odps", "io.kestra.plugin.alibaba.shaded.odps"
+    relocate "com.aliyun.openservices", "io.kestra.plugin.alibaba.shaded.openservices"
+    relocate "org.apache.arrow", "io.kestra.plugin.alibaba.shaded.arrow"
+    relocate "com.google.protobuf", "io.kestra.plugin.alibaba.shaded.protobuf"
+    relocate "com.alibaba.fastjson", "io.kestra.plugin.alibaba.shaded.fastjson"
+    relocate "org.apache.http", "io.kestra.plugin.alibaba.shaded.http"
+    relocate "org.simpleframework", "io.kestra.plugin.alibaba.shaded.simpleframework"
+}
+
+tasks.register('verifyPluginJar', Test) {
+    description = 'Runs service integration tests against the packaged plugin instead of main class directories.'
+    group = 'verification'
+    dependsOn testClasses
+    def artifact = providers.gradleProperty('pluginJar')
+    if (!artifact.isPresent()) {
+        dependsOn jar, shadowJar
+    }
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = files(sourceSets.test.output, artifact.isPresent() ? files(artifact.get()) : shadowJar.archiveFile) + configurations.testRuntimeClasspath
+    useJUnitPlatform()
+    filter {
+        excludeTestsMatching '*.cancellationDuringSubmissionStopsReturnedInstanceOnce'
+    }
 }
 
 /**********************************************************************************************************************\

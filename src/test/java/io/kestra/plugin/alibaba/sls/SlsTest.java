@@ -1,234 +1,243 @@
 package io.kestra.plugin.alibaba.sls;
 
+import com.aliyun.openservices.log.common.Logs;
+import com.aliyun.openservices.log.util.LZ4Encoder;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.conditions.ConditionContext;
-import io.kestra.core.models.executions.Execution;
+import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.common.FetchType;
 import io.kestra.core.models.triggers.TriggerContext;
-import io.kestra.core.runners.RunContext;
+import io.kestra.core.runners.DefaultRunContext;
 import io.kestra.core.runners.RunContextFactory;
+import io.kestra.core.serializers.FileSerde;
+import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
+import java.time.Duration;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.*;
+import java.io.FileOutputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.IntStream;
 
-import static com.github.tomakehurst.wiremock.client.WireMock.*;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.*;
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @KestraTest
 class SlsTest {
     @Inject
     private RunContextFactory runContextFactory;
-
-
-    private static WireMockServer wireMockServer;
+    private static WireMockServer server;
 
     @BeforeAll
-    static void startWireMock() {
-        wireMockServer = new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
-        wireMockServer.start();
+    static void start() {
+        server = new WireMockServer(WireMockConfiguration.options().dynamicPort());
+        server.start();
     }
 
     @AfterAll
-    static void stopWireMock() {
-        if (wireMockServer != null) {
-            wireMockServer.stop();
+    static void stop() {
+        server.stop();
+    }
+
+    @BeforeEach
+    void reset() {
+        server.resetAll();
+    }
+
+    private String endpoint() {
+        return "http://localhost:" + server.port();
+    }
+
+    private Query.QueryBuilder<?, ?> query(FetchType mode) {
+        return Query.builder().id("query").type(Query.class.getName())
+            .accessKeyId(Property.ofValue("ak")).accessKeySecret(Property.ofValue("sk"))
+            .endpointOverride(Property.ofValue(endpoint())).project(Property.ofValue("test-project"))
+            .logstore(Property.ofValue("test-logstore")).fetchType(Property.ofValue(mode));
+    }
+
+    private Push.PushBuilder<?, ?> push(Object from) {
+        return Push.builder().id("push").type(Push.class.getName())
+            .accessKeyId(Property.ofValue("ak")).accessKeySecret(Property.ofValue("sk"))
+            .endpointOverride(Property.ofValue(endpoint())).project(Property.ofValue("test-project"))
+            .logstore(Property.ofValue("test-logstore")).from(from);
+    }
+
+    private void stubQuery(String progress) {
+        server.stubFor(post(urlPathEqualTo("/logstores/test-logstore/logs"))
+            .willReturn(aResponse().withHeader("Content-Type", "application/json")
+                .withHeader("x-log-count", "2").withHeader("x-log-progress", progress)
+                .withBody("""
+                    {"meta":{"progress":"%s"},"data":[
+                    {"__time__":"1609459200","__source__":"host","message":"First error"},
+                    {"__time__":"1609459201","__source__":"host","message":"Second error"}]}
+                    """.formatted(progress))));
+    }
+
+    @Test
+    void queryAllFetchModesAgainstRealEndpoint() throws Exception {
+        stubQuery("Complete");
+        var rc = runContextFactory.of(Map.of());
+        assertEquals("First error", query(FetchType.FETCH).build().run(rc).getLogs().getFirst().get("message"));
+        assertEquals("First error", query(FetchType.FETCH_ONE).build().run(rc).getLog().get("message"));
+        assertEquals(2L, query(FetchType.NONE).build().run(rc).getCount());
+        var stored = query(FetchType.STORE).build().run(rc);
+        var rows = new ArrayList<Object>();
+        try (var input = rc.storage().getFile(stored.getUri())) {
+            FileSerde.read(input, rows::add);
         }
+        assertEquals(2, rows.size());
+        server.verify(4, postRequestedFor(urlPathEqualTo("/logstores/test-logstore/logs"))
+            .withHeader("Host", equalTo("localhost:" + server.port())));
     }
 
     @Test
-    void shouldQueryLogsWithWireMock() throws Exception {
-        // Mock SLS GetLogs response
-        wireMockServer.stubFor(
-            post(urlPathMatching("/logstores/test-logstore/logs"))
-                .willReturn(
-                    aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withHeader("x-log-count", "2")
-                        .withHeader("x-log-progress", "Complete")
-                        .withBody("""
-                            {
-                              "meta": {
-                                "progress": "Complete"
-                              },
-                              "data": [
-                                {
-                                  "__time__": "1609459200",
-                                  "__source__": "127.0.0.1",
-                                  "message": "First error",
-                                  "level": "ERROR"
-                                },
-                                {
-                                  "__time__": "1609459201",
-                                  "__source__": "127.0.0.1",
-                                  "message": "Second error",
-                                  "level": "ERROR"
-                                }
-                              ]
-                            }
-                            """)
-                )
-        );
+    void invalidBoundsTimesAndIncompleteQueriesFail() {
+        var rc = runContextFactory.of(Map.of());
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).lines(Property.ofValue(101)).build().run(rc));
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).offset(Property.ofValue(-1)).build().run(rc));
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).from(Property.ofValue("invalid")).build().run(rc));
+        stubQuery("Incomplete");
+        assertThrows(IllegalStateException.class, () -> query(FetchType.FETCH).build().run(rc));
+    }
 
-        RunContext runContext = runContextFactory.of(Map.of());
-
-        Query queryTask = Query.builder()
-            .id("sls-query")
-            .type(Query.class.getName())
-            .accessKeyId(Property.ofValue("test-ak"))
-            .accessKeySecret(Property.ofValue("test-sk"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpoint(Property.ofValue("http://localhost:" + wireMockServer.port()))
-            .project(Property.ofValue("test-project"))
-            .logstore(Property.ofValue("test-logstore"))
-            .query(Property.ofValue("level: ERROR"))
-            .fetchType(Property.ofValue(FetchType.FETCH))
-            .build();
-
-        Query.Output output = queryTask.run(runContext);
-
-        assertThat(output.getCount(), is(2L));
-        assertThat(output.getLogs(), hasSize(2));
-        assertThat(output.getLogs().get(0).get("message"), is("First error"));
-        assertThat(output.getLogs().get(1).get("message"), is("Second error"));
+    private void stubPush() {
+        server.stubFor(post(urlPathEqualTo("/logstores/test-logstore/shards/lb"))
+            .willReturn(aResponse().withHeader("x-log-requestid", "req-123")));
     }
 
     @Test
-    void shouldPushLogsWithWireMock() throws Exception {
-        // Mock SLS PutLogs response
-        wireMockServer.stubFor(
-            post(urlPathMatching("/logstores/test-logstore/shards/lb"))
-                .willReturn(
-                    aResponse()
-                        .withStatus(200)
-                        .withHeader("x-log-requestid", "req-12345")
-                )
-        );
-
-        RunContext runContext = runContextFactory.of(Map.of());
-
-        List<Map<String, Object>> logs = List.of(
-            Map.of("level", "INFO", "message", "Application started", "service", "payment"),
-            Map.of("level", "WARN", "message", "High latency detected", "service", "payment")
-        );
-
-        Push pushTask = Push.builder()
-            .id("sls-push")
-            .type(Push.class.getName())
-            .accessKeyId(Property.ofValue("test-ak"))
-            .accessKeySecret(Property.ofValue("test-sk"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .endpoint(Property.ofValue("http://localhost:" + wireMockServer.port()))
-            .project(Property.ofValue("test-project"))
-            .logstore(Property.ofValue("test-logstore"))
-            .from(Property.ofValue(logs))
-            .build();
-
-        Push.Output output = pushTask.run(runContext);
-        assertThat(output.getCount(), is(2L));
-    }
-
-    @lombok.experimental.SuperBuilder
-    @lombok.NoArgsConstructor
-    public static class TestableTrigger extends Trigger {
-        private String cursorKey;
-        @lombok.Builder.Default
-        private int callCount = 0;
-
-        @Override
-        public Optional<Execution> evaluate(ConditionContext condCtx, TriggerContext ctx) throws Exception {
-            RunContext rc = condCtx.getRunContext();
-            var kv = rc.namespaceKv(ctx.getNamespace()).getValue(cursorKey);
-
-            callCount++;
-            if (callCount == 1) {
-                int now = 1700000100;
-                rc.namespaceKv(ctx.getNamespace()).put(
-                    cursorKey,
-                    new KVValueAndMetadata(new KVMetadata("trigger cursor", (Duration) null), String.valueOf(now).getBytes(StandardCharsets.UTF_8))
-                );
-
-                Query.Output output = Query.Output.builder()
-                    .logs(List.of(Map.of("message", "Error in auth service")))
-                    .count(1L)
-                    .build();
-
-                return Optional.of(io.kestra.core.models.triggers.TriggerService.generateExecution(this, condCtx, ctx, output));
-            } else {
-                return Optional.empty();
-            }
+    void pushInlineAndStoredIonInBoundedBatches() throws Exception {
+        stubPush();
+        var rc = runContextFactory.of(Map.of());
+        var records = IntStream.range(0, 4097).mapToObj(i -> Map.<String, Object>of("message", "item " + i)).toList();
+        assertEquals(4097L, push(records).build().run(rc).getCount());
+        server.verify(2, postRequestedFor(urlPathEqualTo("/logstores/test-logstore/shards/lb")));
+        var file = rc.workingDir().createTempFile(".ion").toFile();
+        try (var output = new FileOutputStream(file)) {
+            FileSerde.write(output, Map.of("message", "from storage"));
         }
+        var uri = rc.storage().putFile(file);
+        assertEquals(1L, push(uri.toString()).build().run(rc).getCount());
     }
 
     @Test
-    void shouldTriggerWithCursorAndPreventDuplicates() throws Exception {
-        String namespace = "company.team";
-        String flowId = "sls_flow";
-        String triggerId = "sls_trigger";
+    void pushRejectsInvalidTimestampAndPreservesUnsignedEpoch() throws Exception {
+        stubPush();
+        var rc = runContextFactory.of(Map.of());
+        var error = assertThrows(IllegalArgumentException.class,
+            () -> push(List.of(Map.of("__time__", "bad"))).build().run(rc));
+        assertTrue(error.getMessage().contains("Record 1"));
+        assertThrows(IllegalArgumentException.class, () -> push(List.of(Map.of("__time__", "4294967296"))).build().run(rc));
+        assertEquals(1L, push(List.of(Map.of("__time__", "2200000000", "message", "future"))).build().run(rc).getCount());
+    }
 
-        RunContext runContext = runContextFactory.of(Map.of(
-            "flow", Map.of(
-                "id", flowId,
-                "namespace", namespace,
-                "tenantId", "main"
-            )
-        ));
+    private Trigger.TriggerBuilder<?, ?> trigger(FetchType mode, String id) {
+        return Trigger.builder().id(id).type(Trigger.class.getName())
+            .accessKeyId(Property.ofValue("ak")).accessKeySecret(Property.ofValue("sk"))
+            .endpointOverride(Property.ofValue(endpoint())).project(Property.ofValue("test-project"))
+            .logstore(Property.ofValue("test-logstore")).query(Property.ofValue("* | where level == 'ERROR'"))
+            .fetchType(Property.ofValue(mode));
+    }
 
-        TriggerContext triggerContext = TriggerContext.builder()
-            .tenantId("main")
-            .namespace(namespace)
-            .flowId(flowId)
-            .triggerId(triggerId)
-            .build();
+    private void stubShards() {
+        server.stubFor(get(urlPathEqualTo("/logstores/test-logstore/shards"))
+            .willReturn(aResponse().withBody("[{\"shardID\":0,\"status\":\"readwrite\",\"inclusiveBeginKey\":\"0\",\"exclusiveEndKey\":\"f\",\"createTime\":1}]")));
+        server.stubFor(get(urlPathEqualTo("/logstores/test-logstore/shards/0"))
+            .withQueryParam("type", equalTo("cursor")).willReturn(aResponse().withBody("{\"cursor\":\"start\"}")));
+        server.stubFor(get(urlPathEqualTo("/logstores/test-logstore/shards/0"))
+            .withQueryParam("type", equalTo("cursor")).withQueryParam("from", equalTo("end"))
+            .willReturn(aResponse().withBody("{\"cursor\":\"end\"}")));
+    }
 
-        io.kestra.core.models.flows.Flow flow = io.kestra.core.models.flows.Flow.builder()
-            .id(flowId)
-            .namespace(namespace)
-            .revision(1)
-            .build();
+    private void stubPage(String cursor, String next, int logs) throws Exception {
+        var group = Logs.LogGroup.newBuilder().setSource("host").setTopic("errors");
+        for (var i = 0; i < logs; i++) {
+            group.addLogs(Logs.Log.newBuilder().setTime(1)
+                .addContents(Logs.Log.Content.newBuilder().setKey("message").setValue("late log " + i)));
+        }
+        var raw = Logs.LogGroupList.newBuilder().addLogGroupList(group).build().toByteArray();
+        server.stubFor(get(urlPathEqualTo("/logstores/test-logstore/shards/0"))
+            .withQueryParam("type", equalTo("log")).withQueryParam("cursor", equalTo(cursor))
+            .withQueryParam("end_cursor", equalTo("end")).withQueryParam("query", equalTo("* | where level == 'ERROR'"))
+            .willReturn(aResponse().withHeader("x-log-bodyrawsize", String.valueOf(raw.length))
+                .withHeader("x-log-count", "1").withHeader("x-log-cursor", next)
+                .withHeader("x-log-compresstype", "lz4").withBody(LZ4Encoder.compressToLhLz4Chunk(raw))));
+    }
 
-        ConditionContext conditionContext = ConditionContext.builder()
-            .runContext(runContext)
-            .flow(flow)
-            .build();
+    @Test
+    void realTriggerConsumesAllPagesAndPersistsShardCursorsForFetchAndStore() throws Exception {
+        stubShards();
+        stubPage("start", "middle", 101);
+        stubPage("middle", "end", 2);
+        for (var mode : List.of(FetchType.FETCH, FetchType.STORE)) {
+            var id = "trigger-" + UUID.randomUUID();
+            var task = trigger(mode, id).build();
+            var ctx = TriggerContext.builder().tenantId("main").namespace("company.team").flowId("sls_flow").triggerId(id).build();
+            var rc = runContextFactory.of(Map.of("flow", Map.of("namespace", ctx.getNamespace(), "id", ctx.getFlowId(), "tenantId", "main")));
+            runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
+            var cond = ConditionContext.builder().runContext(rc)
+                .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
+            var first = task.evaluate(cond, ctx).orElseThrow();
+            assertEquals(103L, ((Number) first.getTrigger().getVariables().get("count")).longValue());
+            var state = rc.namespaceKv(ctx.getNamespace()).getValue(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore")).orElseThrow();
+            assertEquals("end", JacksonMapper.ofJson().readValue((byte[]) state.value(), Map.class).get("0"));
+            assertFalse(task.evaluate(cond, ctx).isPresent());
+        }
+        server.verify(4, getRequestedFor(urlPathEqualTo("/logstores/test-logstore/shards/0")).withQueryParam("type", equalTo("log")));
+    }
 
-        String cursorKey = io.kestra.core.models.triggers.StatefulTriggerService.defaultKey(namespace, flowId, triggerId) + "_cursor";
+    @Test
+    void failedPageDoesNotCommitCursor() throws Exception {
+        stubShards();
+        stubPage("start", "start", 1);
+        var id = "failed-" + UUID.randomUUID();
+        var task = trigger(FetchType.FETCH, id).build();
+        var ctx = TriggerContext.builder().tenantId("main").namespace("company.team").flowId("sls_flow").triggerId(id).build();
+        var rc = runContextFactory.of(Map.of("flow", Map.of("namespace", ctx.getNamespace(), "id", ctx.getFlowId(), "tenantId", "main")));
+        runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
+        var cond = ConditionContext.builder().runContext(rc).flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
+        assertThrows(IllegalStateException.class, () -> task.evaluate(cond, ctx));
+        assertFalse(rc.namespaceKv(ctx.getNamespace()).getValue(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore")).isPresent());
+    }
 
-        TestableTrigger trigger = TestableTrigger.builder()
-            .id(triggerId)
-            .cursorKey(cursorKey)
-            .accessKeyId(Property.ofValue("ak"))
-            .accessKeySecret(Property.ofValue("sk"))
-            .region(Property.ofValue("cn-hangzhou"))
-            .project(Property.ofValue("test-project"))
-            .logstore(Property.ofValue("test-logstore"))
-            .query(Property.ofValue("level: ERROR"))
-            .build();
+    @Test
+    void corruptStateFailsBeforeCallingService() throws Exception {
+        var id = "corrupt-" + UUID.randomUUID();
+        var task = trigger(FetchType.FETCH, id).build();
+        var ctx = TriggerContext.builder().tenantId("main").namespace("company.team").flowId("state_test").triggerId(id).build();
+        var rc = runContextFactory.of(Map.of("flow", Map.of("namespace", ctx.getNamespace(), "id", ctx.getFlowId(), "tenantId", "main")));
+        runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
+        var cond = ConditionContext.builder().runContext(rc)
+            .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
+        rc.namespaceKv(ctx.getNamespace()).put(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore"),
+            new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), "invalid JSON".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        assertThrows(Exception.class, () -> task.evaluate(cond, ctx));
+        assertEquals(0, server.getAllServeEvents().size());
+    }
 
-        runContextFactory.initializer().forScheduler((io.kestra.core.runners.DefaultRunContext) runContext, triggerContext, trigger);
-
-        // 1st run should fire
-        Optional<Execution> firstExecution = trigger.evaluate(conditionContext, triggerContext);
-        assertThat(firstExecution.isPresent(), is(true));
-
-        // Verify cursor persisted
-        var persisted = runContext.namespaceKv(namespace).getValue(cursorKey);
-        assertThat(persisted.isPresent(), is(true));
-        assertThat(new String((byte[]) persisted.get().value(), StandardCharsets.UTF_8), is("1700000100"));
-
-        // 2nd run should not re-fire
-        Optional<Execution> secondExecution = trigger.evaluate(conditionContext, triggerContext);
-        assertThat(secondExecution.isPresent(), is(false));
+    @Test
+    void cursorKeysCannotCollideOnUnderscores() {
+        assertNotEquals(Trigger.cursorKey("a_b", "c", "p", "l"), Trigger.cursorKey("a", "b_c", "p", "l"));
     }
 }

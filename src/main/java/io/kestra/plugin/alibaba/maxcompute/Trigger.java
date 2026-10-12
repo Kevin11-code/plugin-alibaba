@@ -7,19 +7,32 @@ import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.common.FetchType;
-import io.kestra.core.models.triggers.*;
-import io.kestra.core.runners.RunContext;
+import io.kestra.core.models.triggers.AbstractTrigger;
+import io.kestra.core.models.triggers.PollingTriggerInterface;
+import io.kestra.core.models.triggers.TriggerContext;
+import io.kestra.core.models.triggers.TriggerOutput;
+import io.kestra.core.models.triggers.TriggerService;
+import io.kestra.core.serializers.FileSerde;
+import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
+import io.kestra.plugin.alibaba.AbstractConnection;
 import io.kestra.plugin.alibaba.AlibabaConnectionInterface;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
-import lombok.*;
+import lombok.Builder;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.ToString;
 import lombok.experimental.SuperBuilder;
 
-import java.nio.charset.StandardCharsets;
+import java.math.BigDecimal;
 import java.time.Duration;
-import java.util.*;
+import java.time.Instant;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 @SuperBuilder
 @ToString
@@ -53,6 +66,7 @@ import java.util.*;
                     project: analytics
                     sql: "SELECT * FROM orders WHERE id > '{{ trigger.watermark }}' ORDER BY id ASC LIMIT 50"
                     watermarkField: id
+                    initialWatermark: "0"
                     interval: PT5M
                     fetchType: FETCH
                 """
@@ -84,14 +98,13 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     @ToString.Exclude
     protected Property<String> securityToken;
 
-    @NotNull
-    @Schema(title = "Region")
+    @Schema(title = "Region", description = "Region used to derive the endpoint when endpointOverride is absent.")
     @PluginProperty(group = "connection")
     protected Property<String> region;
 
     @Schema(title = "Endpoint override")
     @PluginProperty(group = "connection")
-    protected Property<String> endpoint;
+    protected Property<String> endpointOverride;
 
     @NotNull
     @Schema(title = "Project", description = "MaxCompute project name.")
@@ -99,11 +112,12 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     private Property<String> project;
 
     @NotNull
-    @Schema(title = "SQL query", description = "Query executed on each poll. May reference {{ trigger.watermark }}.")
+    @Schema(title = "SQL query", description = "Query executed on each poll. May reference {{ trigger.watermark }}, escaped for a single-quoted SQL literal. Use an appropriate initialWatermark and filter strictly greater than the watermark.")
     @PluginProperty(group = "main")
     private Property<String> sql;
 
-    @Schema(title = "Watermark column", description = "Column name to track as watermark in namespace KV store.")
+    @NotNull
+    @Schema(title = "Watermark column", description = "Required monotonically increasing column. Numeric values compare numerically; ISO instants compare chronologically; other strings compare lexicographically. Order ascending and avoid splitting equal watermark values across batches.")
     @PluginProperty(group = "processing")
     private Property<String> watermarkField;
 
@@ -112,79 +126,110 @@ public class Trigger extends AbstractTrigger implements PollingTriggerInterface,
     @PluginProperty(group = "processing")
     private Property<FetchType> fetchType = Property.ofValue(FetchType.FETCH);
 
+    @Builder.Default
+    @Schema(title = "Initial watermark", description = "Value exposed before the first poll; defaults to empty string. For numeric IDs, set a lower bound such as 0.")
+    @PluginProperty(group = "processing")
+    private Property<String> initialWatermark = Property.ofValue("");
+
     @Schema(title = "Tunnel endpoint override")
     @PluginProperty(group = "advanced")
     private Property<String> tunnelEndpoint;
 
     @Override
     public Optional<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) throws Exception {
-        RunContext runContext = conditionContext.getRunContext();
-        String rNamespace = context.getNamespace();
-        String watermarkKey = StatefulTriggerService.defaultKey(rNamespace, context.getFlowId(), this.getId()) + "_watermark";
-
-        String previousWatermark = "";
-        try {
-            var kvOptional = runContext.namespaceKv(rNamespace).getValue(watermarkKey);
-            if (kvOptional.isPresent() && kvOptional.get().value() != null) {
-                previousWatermark = new String((byte[]) kvOptional.get().value(), StandardCharsets.UTF_8);
-            }
-        } catch (Exception e) {
-            runContext.logger().warn("Could not read watermark from KV store", e);
+        var runContext = conditionContext.getRunContext();
+        var namespace = context.getNamespace();
+        var key = watermarkKey(context.getFlowId(), getId());
+        var field = AbstractConnection.required(runContext, watermarkField, "watermarkField");
+        var mode = runContext.render(fetchType).as(FetchType.class).orElse(FetchType.FETCH);
+        if (mode != FetchType.FETCH && mode != FetchType.STORE) {
+            throw new IllegalArgumentException("Trigger `fetchType` must be FETCH or STORE");
         }
-
-        Map<String, Object> variables = Map.of(
-            "watermark", previousWatermark,
-            "trigger", Map.of("watermark", previousWatermark)
-        );
-
-        String renderedSql = runContext.render(this.sql).as(String.class, variables).orElseThrow();
-
-        Query query = Query.builder()
-            .id(this.getId())
-            .type(Query.class.getName())
-            .accessKeyId(this.accessKeyId)
-            .accessKeySecret(this.accessKeySecret)
-            .securityToken(this.securityToken)
-            .region(this.region)
-            .endpoint(this.endpoint)
-            .project(this.project)
-            .sql(Property.ofValue(renderedSql))
-            .fetchType(this.fetchType)
-            .tunnelEndpoint(this.tunnelEndpoint)
-            .build();
-
-        Query.Output output = query.run(runContext);
-
+        var persisted = runContext.namespaceKv(namespace).getValue(key);
+        Watermark previous = persisted.isPresent()
+            ? JacksonMapper.ofJson().readValue((byte[]) persisted.get().value(), Watermark.class) : null;
+        var value = previous == null ? runContext.render(initialWatermark).as(String.class).orElse("") : previous.value();
+        var escaped = escapeWatermark(value);
+        var variables = Map.<String, Object>of("watermark", escaped, "trigger", Map.of("watermark", escaped));
+        var renderedSql = runContext.render(sql).as(String.class, variables).filter(sql -> !sql.isBlank())
+            .orElseThrow(() -> new IllegalArgumentException("`sql` is required"));
+        var task = Query.builder().id(getId()).type(Query.class.getName())
+            .accessKeyId(accessKeyId).accessKeySecret(accessKeySecret).securityToken(securityToken)
+            .region(region).endpointOverride(endpointOverride).project(project)
+            .sql(Property.ofValue(renderedSql)).fetchType(fetchType).tunnelEndpoint(tunnelEndpoint).build();
+        var output = task.run(runContext);
         if (output.getSize() == null || output.getSize() == 0) {
             return Optional.empty();
         }
-
-        String rWatermarkField = runContext.render(this.watermarkField).as(String.class).orElse(null);
-        if (rWatermarkField != null && output.getRows() != null && !output.getRows().isEmpty()) {
-            String maxWatermark = previousWatermark;
-            for (Map<String, Object> row : output.getRows()) {
-                Object val = row.get(rWatermarkField);
-                if (val != null) {
-                    String strVal = String.valueOf(val);
-                    if (maxWatermark.isEmpty() || strVal.compareTo(maxWatermark) > 0) {
-                        maxWatermark = strVal;
+        var max = new AtomicReference<>(previous);
+        java.util.function.Consumer<Map<String, Object>> track = row -> {
+            var next = Watermark.of(row.get(field));
+            if (max.get() == null || next.compareTo(max.get()) > 0) {
+                max.set(next);
+            }
+        };
+        if (mode == FetchType.STORE) {
+            try (var input = runContext.storage().getFile(output.getUri())) {
+                FileSerde.read(input, row -> {
+                    if (!(row instanceof Map<?, ?> map)) {
+                        throw new IllegalArgumentException("Stored MaxCompute result must contain rows");
                     }
-                }
+                    var next = Watermark.of(map.get(field));
+                    if (max.get() == null || next.compareTo(max.get()) > 0) {
+                        max.set(next);
+                    }
+                });
             }
+        } else {
+            output.getRows().forEach(track);
+        }
+        if (max.get().equals(previous)) {
+            return Optional.empty();
+        }
+        var execution = TriggerService.generateExecution(this, conditionContext, context, output);
+        runContext.namespaceKv(namespace).put(key, new KVValueAndMetadata(new KVMetadata("MaxCompute watermark", (Duration) null),
+            JacksonMapper.ofJson().writeValueAsBytes(max.get())));
+        return Optional.of(execution);
+    }
 
-            if (!maxWatermark.equals(previousWatermark)) {
+    public static String watermarkKey(String flowId, String triggerId) {
+        return "maxcompute_watermark_" + flowId.length() + "_" + flowId + "_" + triggerId.length() + "_" + triggerId;
+    }
+
+    static String escapeWatermark(String value) {
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t").replace("\0", "\\0");
+    }
+
+    public record Watermark(String type, String value) implements Comparable<Watermark> {
+        static Watermark of(Object value) {
+            if (value == null) {
+                throw new IllegalArgumentException("Every row must have a non-null `watermarkField`");
+            }
+            if (value instanceof Number number) {
+                return new Watermark("number", new BigDecimal(number.toString()).toPlainString());
+            }
+            if (value instanceof String string) {
                 try {
-                    runContext.namespaceKv(rNamespace).put(
-                        watermarkKey,
-                        new KVValueAndMetadata(new KVMetadata("trigger watermark", (Duration) null), maxWatermark.getBytes(StandardCharsets.UTF_8))
-                    );
-                } catch (Exception e) {
-                    runContext.logger().warn("Could not persist watermark to KV store", e);
+                    return new Watermark("instant", Instant.parse(string).toString());
+                } catch (java.time.format.DateTimeParseException e) {
+                    return new Watermark("string", string);
                 }
             }
+            throw new IllegalArgumentException("Unsupported watermark type: " + value.getClass().getName());
         }
 
-        Execution execution = TriggerService.generateExecution(this, conditionContext, context, output);
-        return Optional.of(execution);
+        @Override
+        public int compareTo(Watermark other) {
+            if (!type.equals(other.type)) {
+                throw new IllegalArgumentException("Watermark column type changed from " + other.type + " to " + type);
+            }
+            return switch (type) {
+                case "number" -> new BigDecimal(value).compareTo(new BigDecimal(other.value));
+                case "instant" -> Instant.parse(value).compareTo(Instant.parse(other.value));
+                case "string" -> value.compareTo(other.value);
+                default -> throw new IllegalArgumentException("Unsupported persisted watermark type: " + type);
+            };
+        }
     }
 }

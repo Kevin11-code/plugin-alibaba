@@ -1,20 +1,14 @@
-# Alibaba Cloud Plugin - MaxCompute and Simple Log Service (SLS)
+# Kestra Alibaba Cloud Plugin
 
 ## What
 
-- Provides tasks and triggers for Alibaba Cloud MaxCompute under `io.kestra.plugin.alibaba.maxcompute`:
-  - `Query`: Executes SQL statements against MaxCompute tables with multiple fetch types (`FETCH_ONE`, `FETCH`, `STORE`) and task cancellation via `kill()`.
-  - `Trigger`: Polling trigger detecting new rows in MaxCompute tables using stateful watermarks persisted in the namespace KV store.
-- Provides tasks and triggers for Alibaba Cloud Simple Log Service under `io.kestra.plugin.alibaba.sls`:
-  - `Query`: Queries logstores over time ranges with `FETCH`, `FETCH_ONE`, or `STORE` modes.
-  - `Push`: Ingests log entries into an SLS logstore from inline collections or internal storage files.
-  - `Trigger`: Polling trigger on new log entries using a persisted epoch cursor in the namespace KV store.
+- Provides plugin components under `io.kestra.plugin.alibaba`.
+- Includes OSS `Upload` and `Download`, MaxCompute `Query` and `Trigger`, and SLS `Query`, `Push`, and `Trigger`.
 
 ## Why
 
-- What user problem does this solve? Users previously relied on external CLIs (`odpscmd`, SLS CLI) or custom scripts with plain-text credentials to interact with Alibaba Cloud data warehouse and log services.
-- Why would a team adopt this plugin in a workflow? Native tasks provide typed properties, secret masking, stored result sets, cancellation handling, and exactly-once event triggers.
-- What operational/business outcome does it enable? Enables data engineers and SRE teams to orchestrate end-to-end data pipelines and reactive alerting workflows on Alibaba Cloud.
+- This plugin integrates Kestra with Alibaba Cloud OSS, MaxCompute, and Simple Log Service.
+- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. Polling triggers persist typed watermarks or shard cursors in namespace KV.
 
 ## How
 
@@ -22,15 +16,22 @@
 
 Single-module plugin. Source packages under `io.kestra.plugin.alibaba`:
 
+- `oss`
 - `maxcompute`
 - `sls`
 
+The root package holds the shared connection base (`AlibabaConnectionInterface`, `AbstractConnection`). The `oss` package holds `AbstractOss`, which builds the OSS client, and the tasks.
+
+Tests exercise OSS, MaxCompute instance/result-tunnel APIs, and SLS endpoints through WireMock, so no cloud credentials are needed.
+
 ### Key Plugin Classes
 
+- `io.kestra.plugin.alibaba.oss.Upload`
+- `io.kestra.plugin.alibaba.oss.Download`
 - `io.kestra.plugin.alibaba.maxcompute.Query`
 - `io.kestra.plugin.alibaba.maxcompute.Trigger`
-- `io.kestra.plugin.alibaba.sls.Push`
 - `io.kestra.plugin.alibaba.sls.Query`
+- `io.kestra.plugin.alibaba.sls.Push`
 - `io.kestra.plugin.alibaba.sls.Trigger`
 
 ### Project Structure
@@ -38,17 +39,6 @@ Single-module plugin. Source packages under `io.kestra.plugin.alibaba`:
 ```
 plugin-alibaba/
 ├── src/main/java/io/kestra/plugin/alibaba/
-│   ├── maxcompute/
-│   │   ├── Query.java
-│   │   ├── Trigger.java
-│   │   └── package-info.java
-│   ├── sls/
-│   │   ├── Push.java
-│   │   ├── Query.java
-│   │   ├── Trigger.java
-│   │   └── package-info.java
-│   ├── AbstractConnection.java
-│   └── AlibabaConnectionInterface.java
 ├── src/test/java/io/kestra/plugin/alibaba/
 ├── build.gradle
 └── README.md
