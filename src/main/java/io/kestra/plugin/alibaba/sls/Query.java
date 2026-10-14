@@ -14,8 +14,6 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.FileSerde;
 import io.kestra.plugin.alibaba.AbstractConnection;
 import io.swagger.v3.oas.annotations.media.Schema;
-import jakarta.validation.constraints.Max;
-import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import lombok.Builder;
 import lombok.EqualsAndHashCode;
@@ -100,14 +98,11 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
     @Builder.Default
     @Schema(title = "Offset", description = "Non-negative line offset for pagination; defaults to 0.")
     @PluginProperty(group = "processing")
-    @Min(0)
     private Property<Integer> offset = Property.ofValue(0);
 
     @Builder.Default
-    @Schema(title = "Lines", description = "Maximum number of log lines to return; defaults to 100, max 100.")
+    @Schema(title = "Lines", description = "Number of log lines to return, between 1 and 100; defaults to 100.")
     @PluginProperty(group = "processing")
-    @Min(1)
-    @Max(100)
     private Property<Integer> lines = Property.ofValue(100);
 
     @Builder.Default

@@ -3,12 +3,12 @@
 ## What
 
 - Provides plugin components under `io.kestra.plugin.alibaba`.
-- Includes OSS `Upload` and `Download`, MaxCompute `Query` and `Trigger`, and SLS `Query`, `Push`, and `Trigger`.
+- Includes OSS `Upload`, `Download`, `List`, `Delete`, `Copy`, and `Trigger`, MaxCompute `Query` and `Trigger`, and SLS `Query`, `Push`, and `Trigger`.
 
 ## Why
 
 - This plugin integrates Kestra with Alibaba Cloud OSS, MaxCompute, and Simple Log Service.
-- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. Polling triggers persist typed watermarks or shard cursors in namespace KV.
+- It moves files through OSS, runs MaxCompute SQL, and queries or ingests SLS logs with typed properties and secret masking. MaxCompute and SLS polling triggers persist typed watermarks or shard cursors in namespace KV.
 
 ## How
 
@@ -28,6 +28,10 @@ Tests exercise OSS, MaxCompute instance/result-tunnel APIs, and SLS endpoints th
 
 - `io.kestra.plugin.alibaba.oss.Upload`
 - `io.kestra.plugin.alibaba.oss.Download`
+- `io.kestra.plugin.alibaba.oss.List`
+- `io.kestra.plugin.alibaba.oss.Delete`
+- `io.kestra.plugin.alibaba.oss.Copy`
+- `io.kestra.plugin.alibaba.oss.Trigger`
 - `io.kestra.plugin.alibaba.maxcompute.Query`
 - `io.kestra.plugin.alibaba.maxcompute.Trigger`
 - `io.kestra.plugin.alibaba.sls.Query`

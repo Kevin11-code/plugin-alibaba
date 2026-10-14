@@ -16,7 +16,6 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
-import java.time.Duration;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -24,6 +23,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -115,7 +116,11 @@ class SlsTest {
     void invalidBoundsTimesAndIncompleteQueriesFail() {
         var rc = runContextFactory.of(Map.of());
         assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).lines(Property.ofValue(101)).build().run(rc));
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).lines(Property.ofValue(0)).build().run(rc));
         assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).offset(Property.ofValue(-1)).build().run(rc));
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).lines(Property.ofExpression("{{ 101 }}")).build().run(rc));
+        assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).offset(Property.ofExpression("{{ -1 }}")).build().run(rc));
+        assertEquals(0, server.getAllServeEvents().size());
         assertThrows(IllegalArgumentException.class, () -> query(FetchType.FETCH).from(Property.ofValue("invalid")).build().run(rc));
         stubQuery("Incomplete");
         assertThrows(IllegalStateException.class, () -> query(FetchType.FETCH).build().run(rc));
@@ -232,7 +237,7 @@ class SlsTest {
             .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
         for (var state : List.of("invalid JSON", "null", "{\"0\":null}", "{\"0\":\" \"}", "{\"\":\"end\"}")) {
             rc.namespaceKv(ctx.getNamespace()).put(Trigger.cursorKey(ctx.getFlowId(), id, "test-project", "test-logstore"),
-                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(StandardCharsets.UTF_8)));
             assertThrows(Exception.class, () -> task.evaluate(cond, ctx), state);
         }
         assertEquals(0, server.getAllServeEvents().size());

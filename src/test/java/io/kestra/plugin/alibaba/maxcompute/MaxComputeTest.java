@@ -6,8 +6,12 @@ import com.aliyun.odps.Odps;
 import com.aliyun.odps.OdpsType;
 import com.aliyun.odps.TableSchema;
 import com.aliyun.odps.data.ArrayRecord;
-import com.aliyun.odps.tunnel.io.ProtobufRecordPack;
+import com.aliyun.odps.data.Binary;
+import com.aliyun.odps.data.Char;
+import com.aliyun.odps.data.Varchar;
 import com.aliyun.odps.task.SQLTask;
+import com.aliyun.odps.tunnel.io.ProtobufRecordPack;
+import com.aliyun.odps.type.TypeInfoFactory;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import io.kestra.core.junit.annotations.KestraTest;
@@ -22,13 +26,14 @@ import io.kestra.core.serializers.FileSerde;
 import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.storages.kv.KVMetadata;
 import io.kestra.core.storages.kv.KVValueAndMetadata;
-import java.time.Duration;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -36,23 +41,23 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
-import static com.github.tomakehurst.wiremock.client.WireMock.containing;
-import static com.github.tomakehurst.wiremock.client.WireMock.get;
-import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.absent;
+import static com.github.tomakehurst.wiremock.client.WireMock.containing;
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.times;
@@ -106,15 +111,108 @@ class MaxComputeTest {
             row.setBigint(0, value);
             pack.append(row);
         }
+        stubResult(schema, pack, values.length);
+    }
+
+    private void stubResult(TableSchema schema, ProtobufRecordPack pack, int count) throws Exception {
         pack.complete();
+        var columns = new ArrayList<Map<String, String>>();
+        for (var column : schema.getColumns()) {
+            columns.add(Map.of("name", column.getName(), "type", column.getTypeInfo().getTypeName()));
+        }
         server.stubFor(post(urlPathEqualTo("/projects/analytics/instances/instance-1"))
-            .willReturn(aResponse().withBody("""
-                {"DownloadID":"download-1","Status":"Normal","RecordCount":%s,
-                "Schema":{"columns":[{"name":"id","type":"bigint"}]}}
-                """.formatted(values.length))));
+            .willReturn(aResponse().withBody(JacksonMapper.ofJson().writeValueAsString(Map.of(
+                "DownloadID", "download-1", "Status", "Normal", "RecordCount", count,
+                "Schema", Map.of("columns", columns))))));
         server.stubFor(get(urlPathEqualTo("/projects/analytics/instances/instance-1"))
             .withQueryParam("downloadid", equalTo("download-1"))
             .willReturn(aResponse().withBody(pack.getProtobufStream().toByteArray())));
+    }
+
+    private void stubStringResult(String... values) throws Exception {
+        var schema = new TableSchema();
+        schema.addColumn(new Column("name", OdpsType.STRING));
+        var pack = new ProtobufRecordPack(schema);
+        for (var value : values) {
+            var row = new ArrayRecord(schema);
+            row.setString(0, value == null ? null : value.getBytes(StandardCharsets.UTF_8));
+            pack.append(row);
+        }
+        stubResult(schema, pack, values.length);
+    }
+
+    @Test
+    void queryPreservesTextNullsAndBinaryAcrossAllFetchModes() throws Exception {
+        var schema = new TableSchema();
+        schema.addColumn(new Column("name", OdpsType.STRING));
+        schema.addColumn(new Column("short_text", TypeInfoFactory.getVarcharTypeInfo(20)));
+        schema.addColumn(new Column("fixed_text", TypeInfoFactory.getCharTypeInfo(20)));
+        schema.addColumn(new Column("payload", OdpsType.BINARY));
+        var pack = new ProtobufRecordPack(schema);
+        var row = new ArrayRecord(schema);
+        row.setString(0, "alice".getBytes(StandardCharsets.UTF_8));
+        row.set(1, new Varchar("你好"));
+        row.set(2, new Char("ab"));
+        row.set(3, new Binary(new byte[]{0, (byte) 0xff, 42}));
+        pack.append(row);
+        row = new ArrayRecord(schema);
+        row.setString(0, "你好 🌍".getBytes(StandardCharsets.UTF_8));
+        pack.append(row);
+        row = new ArrayRecord(schema);
+        row.setString(0, new byte[0]);
+        pack.append(row);
+        pack.append(new ArrayRecord(schema));
+        stubResult(schema, pack, 4);
+        var rc = runContextFactory.of(Map.of());
+        for (var mode : List.of(FetchType.FETCH, FetchType.FETCH_ONE, FetchType.STORE)) {
+            var output = query(mode).build().run(rc);
+            var rows = new ArrayList<Map<?, ?>>();
+            if (mode == FetchType.STORE) {
+                try (var input = rc.storage().getFile(output.getUri())) {
+                    FileSerde.read(input, value -> rows.add((Map<?, ?>) value));
+                }
+            } else if (mode == FetchType.FETCH_ONE) {
+                rows.add(output.getRow());
+            } else {
+                rows.addAll(output.getRows());
+            }
+            assertEquals("alice", rows.getFirst().get("name"));
+            assertEquals("你好", rows.getFirst().get("short_text"));
+            assertEquals("ab", rows.getFirst().get("fixed_text"));
+            assertArrayEquals(new byte[]{0, (byte) 0xff, 42}, (byte[]) rows.getFirst().get("payload"));
+            assertEquals(mode == FetchType.FETCH_ONE ? 1L : 4L, output.getSize());
+            if (mode != FetchType.FETCH_ONE) {
+                assertEquals("你好 🌍", rows.get(1).get("name"));
+                assertEquals("", rows.get(2).get("name"));
+                assertNull(rows.get(3).get("name"));
+            }
+        }
+    }
+
+    @Test
+    void realTriggerPersistsStringWatermarksInFetchAndStore() throws Exception {
+        for (var mode : List.of(FetchType.FETCH, FetchType.STORE)) {
+            var id = "strings-" + UUID.randomUUID();
+            var task = trigger(mode, id).watermarkField(Property.ofValue("name"))
+                .initialWatermark(Property.ofValue(""))
+                .sql(Property.ofExpression("SELECT name FROM t WHERE name > '{{ trigger.watermark }}' ORDER BY name"))
+                .build();
+            var ctx = TriggerContext.builder().tenantId("main").namespace("company.team").flowId("mc_strings").triggerId(id).build();
+            var rc = runContextFactory.of(Map.of("flow", Map.of("namespace", ctx.getNamespace(), "id", ctx.getFlowId(), "tenantId", "main")));
+            runContextFactory.initializer().forScheduler((DefaultRunContext) rc, ctx, task);
+            var cond = ConditionContext.builder().runContext(rc)
+                .flow(Flow.builder().id(ctx.getFlowId()).namespace(ctx.getNamespace()).revision(1).build()).build();
+            stubStringResult("alice", "bob");
+            assertTrue(task.evaluate(cond, ctx).isPresent());
+            assertFalse(task.evaluate(cond, ctx).isPresent());
+            stubStringResult("carol");
+            assertTrue(task.evaluate(cond, ctx).isPresent());
+            var state = rc.namespaceKv(ctx.getNamespace()).getValue(Trigger.watermarkKey(ctx.getFlowId(), id)).orElseThrow();
+            assertEquals(new Trigger.Watermark("string", "carol"),
+                JacksonMapper.ofJson().readValue((byte[]) state.value(), Trigger.Watermark.class));
+        }
+        server.verify(4, postRequestedFor(urlPathEqualTo("/projects/analytics/instances"))
+            .withRequestBody(containing("name &gt; &apos;bob&apos;")));
     }
 
     @Test
@@ -209,7 +307,7 @@ class MaxComputeTest {
         for (var state : List.of("invalid JSON", "null", "{}", "{\"type\":\"number\",\"value\":\"bad\"}",
             "{\"type\":\"instant\",\"value\":\"bad\"}", "{\"type\":\"unknown\",\"value\":\"10\"}")) {
             rc.namespaceKv(ctx.getNamespace()).put(Trigger.watermarkKey(ctx.getFlowId(), id),
-                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                new KVValueAndMetadata(new KVMetadata("corrupted", (Duration) null), state.getBytes(StandardCharsets.UTF_8)));
             assertThrows(Exception.class, () -> task.evaluate(cond, ctx), state);
         }
         assertEquals(0, server.getAllServeEvents().size());

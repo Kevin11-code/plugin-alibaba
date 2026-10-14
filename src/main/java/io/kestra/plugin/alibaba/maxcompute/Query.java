@@ -1,6 +1,9 @@
 package io.kestra.plugin.alibaba.maxcompute;
 
 import com.aliyun.odps.Odps;
+import com.aliyun.odps.OdpsType;
+import com.aliyun.odps.data.AbstractChar;
+import com.aliyun.odps.data.Binary;
 import com.aliyun.odps.account.Account;
 import com.aliyun.odps.account.AliyunAccount;
 import com.aliyun.odps.account.StsAccount;
@@ -190,13 +193,19 @@ public class Query extends AbstractConnection implements RunnableTask<Query.Outp
                     checkKilled();
                     var row = new LinkedHashMap<String, Object>();
                     for (var i = 0; i < record.getColumnCount(); i++) {
-                        var value = record.get(i);
-                        if (value instanceof java.sql.Date date) {
+                        var column = record.getColumns()[i];
+                        var value = column.getTypeInfo().getOdpsType() == OdpsType.STRING
+                            ? record.getString(i) : record.get(i);
+                        if (value instanceof AbstractChar<?> text) {
+                            value = text.getValue();
+                        } else if (value instanceof Binary binary) {
+                            value = binary.data();
+                        } else if (value instanceof java.sql.Date date) {
                             value = date.toLocalDate().toString();
                         } else if (value instanceof Date date) {
                             value = date.toInstant().toString();
                         }
-                        row.put(record.getColumns()[i].getName(), value);
+                        row.put(column.getName(), value);
                     }
                     if (output == null) {
                         rows.add(row);

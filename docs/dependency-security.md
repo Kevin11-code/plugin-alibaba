@@ -43,4 +43,6 @@ Submit the package/version pairs in the JSON inventory to `POST https://api.osv.
 
 ## Compatibility validation
 
-The final Java 21 / Kestra 1.3.39 build passed all 32 tests and all 25 documentation rules. Its packaged JAR passed 31 integration tests on Kestra 1.3.39, and the same Java 21-built JAR passed all 31 on Java 25 / Kestra 2.0.5. Tests exercise actual SDK calls through WireMock for MaxCompute instance submission/result tunnels, SLS queries/ingestion/shard consumption, and OSS regression coverage. Packaged-JAR tests check runtime linkage independently of the compiled main class directory. No live Alibaba Cloud account was used.
+After the QA fixes and latest OSS merge, the Java 21 / Kestra 1.3.39 build passed all 65 tests and all 25 documentation rules. Its packaged JAR passed 64 tests on Kestra 1.3.39 and 1.3.43, and the same Java 21-built JAR passed all 64 on Java 25 / Kestra 2.0.6. Tests exercise core flow validation/save services, all MaxCompute/SLS examples, SDK-generated STRING/CHAR/VARCHAR/binary fixtures, string watermarks in FETCH/STORE, and the service protocols through WireMock. Packaged-JAR tests check runtime linkage independently of the compiled main class directory.
+
+Kestra 2.0.6 changed the flow-create signature and the upstream OSS test helper's return type. The save test handles both signatures; compatibility validation adapts a generated copy of the upstream OSS fixture to `TriggerState.context()`, preserving its assertions and leaving production code unchanged. No live Alibaba Cloud account or browser UI was used.
